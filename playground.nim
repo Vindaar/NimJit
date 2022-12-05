@@ -5,20 +5,46 @@ import libgccjit
 import typetraits
 
 
-import std / macros
-import std / genasts
+import std / [macros, genasts, sets, tables, options]
 import system / ansi_c
-import std / options
+
+
+from std/sequtils import concat
+proc flatten[T: not seq](a: seq[T]): seq[T] = a
+proc flatten[T: seq](a: seq[T]): auto =  a.concat.flatten
 
 type
   FnParams = seq[(string, NimNode)]
+
+  ## A type storing the symbols for a given type
+  JitType = ref object
+    name: string # the name as a string of this type
+    typ: ptr gcc_jit_type
+    struct: ptr gcc_jit_struct # if it corresponds to a struct
+    `fields`: Table[string, ptr gcc_jit_field]
+
+  JitContext = ref object # ref object as it stores pointers, so copying by value doesn't make a lot of sense
+    ctx: ptr gcc_jit_context
+    # and further fields for the storage of information that stores
+    # things like `gcc_jit_struct` and `gcc_jit_fields` associated.
+    types: Table[string, JitType]
+
   Context = ref object
     fn: NimNode # the current function
+    varCount: int # counter of variables for a custom gensym of sorts
     params: FnParams # the JIT paramaters associated with the function arguments
     blckStack: seq[NimNode] # stack of the current blocks
     nextCallRvalue: bool # determines if the next `nnkCall` encountered must be generated
                          # as an RValue, instead of discarded (add `*_add_eval` or not)
+    seenFns: HashSet[string] ## set of symbols that were already jit'ed
+    hasExplicitReturn: bool ## marks a return statement to know if we still need to terminate
 
+
+proc initJitType(name: string): JitType =
+  result = JitType(name: name,
+                   typ: nil,
+                   struct: nil,
+                   `fields`: initTable[string, ptr gcc_jit_field]())
 
 proc head[T](s: seq[T]): T =
   ## Returns the `head` of the sequence, if `s` is a stack like structure, where
@@ -51,12 +77,13 @@ proc toJitType(s: string): gcc_jit_types =
   of "float32": result = GCC_JIT_TYPE_FLOAT
   of "float64": result = GCC_JIT_TYPE_DOUBLE
   # of "float64" : result = GCC_JIT_TYPE_LONG_DOUBLE
-  of "cstring", "ptr char", "cstringArray": result = GCC_JIT_TYPE_CONST_CHAR_PTR ## XXX: probably not?
+  of "string", "cstring", "ptr char", "cstringArray": result = GCC_JIT_TYPE_CONST_CHAR_PTR ## XXX: probably not?
   of "csize_t": result = GCC_JIT_TYPE_SIZE_T
   of "File" : result = GCC_JIT_TYPE_FILE_PTR
   of "Complex[float32]": result = GCC_JIT_TYPE_COMPLEX_FLOAT
   of "Complex[float]", "Complex[float64]": result = GCC_JIT_TYPE_COMPLEX_DOUBLE
   #of "Complex[float64]": result = JIT_TYPE_COMPLEX_LONG_DOUBLE
+  of "varargs[typed]": result = GCC_JIT_TYPE_CONST_CHAR_PTR ## XXX: HACK!!!
   else:
     doAssert false, "Not supported yet! " & $s
     result = GCC_JIT_TYPE_VOID
@@ -110,53 +137,139 @@ proc toJitInfix(n: NimNode): NimNode =
 template toJitType(typ: typed): gcc_jit_types =
   astToStr(typ).toJitType()
 
-proc toJitType[T](ctx: ptr gcc_jit_context, typ: typedesc[T]): ptr gcc_jit_type =
-  ctx.gcc_jit_context_get_type(toJitType($T))
+proc toJitType[T](jitCtx: JitContext, typ: typedesc[T]): ptr gcc_jit_type =
+  when T is object:
+    # generatet the correct struct
+    ## XXX: handle variant types using tagged union! See my notes!
+    var jitFields = newSeq[ptr gcc_jit_field]()
+    # I fear we have to return the `gcc_jit_field` as well for use later.
+    ## NOTE: libgccjit of later versions have a function to retrieve a struct field
+    ## by index! However this is not available on version 10 yet.
+    ## So what is the solution? In addition we may need the struct information. So better
+    ## split objects and types.
+    ## But then how to deal with `toJitType` calls returning different things? Same for
+    ## `toParam`.
+    ## Difficult, but there's probably a neat solution out there in the ether...
+    ## The Emacs JIT compiler handles it by having a global `comp` object, which stores the
+    ## fields for all the relevant Emacs objects. Of course the same isn't possible for our
+    ## code, but proves we need to keep the fields around.
+    ## Imo that means the `Context` field must be extended to store this information for us.
+    let typName = $T
+    if typName in jitCtx.types:
+      result = jitCtx.types[typName].typ
+    else:
+      ## Generate the JitType that stores all the pointers for later lookup and construct
+      ## the `struct`. Note that currently only flat objects of basic types are supported!
+      var jitType = initJitType(typName)
 
-proc toParam[T](ctx: ptr gcc_jit_context, typ: typedesc[T], name: string): ptr gcc_jit_param =
-  ctx.gcc_jit_context_new_param(nil, ctx.toJitType(typ), name)
+      for field, val in fieldPairs(default(T)):
+        let jitField = jitCtx.ctx.gcc_jit_context_new_field(
+          nil,
+          jitCtx.toJitType(type(val)),
+          field
+        )
+        jitType.`fields`[field] = jitField
+        jitFields.add jitField
 
-proc toRValue(ctx: ptr gcc_jit_context, val: string{lit}): ptr gcc_jit_rvalue =
-  ctx.gcc_jit_context_new_string_literal(val)
+      let struct = jitCtx.ctx.gcc_jit_context_new_struct_type(
+        nil,
+        typName,
+        jitFields.len.cint,
+        jitFields[0].addr
+      )
+      jitType.struct = struct
+      result = gcc_jit_struct_as_type(struct)
+      jitType.typ = result
+      jitCtx.types[typName] = jitType
+  else:
+    jitCtx.ctx.gcc_jit_context_get_type(toJitType($T))
 
-proc toRValue(ctx: ptr gcc_jit_context, val: cstring): ptr gcc_jit_rvalue =
-  ctx.gcc_jit_context_new_string_literal(val)
+#proc toJitType[T](jitCtx: JitContext, typ: typedesc[T]): (Table[string, ptr gcc_jit_field], ptr gcc_jit_type) =
+#  jitCtx.ctx.gcc_jit_context_get_type(toJitType($T))
+
+proc toParam[T](jitCtx: JitContext, typ: typedesc[T], name: string): ptr gcc_jit_param =
+  jitCtx.ctx.gcc_jit_context_new_param(nil, jitCtx.toJitType(typ), name)
+
+proc toRValue(jitCtx: JitContext, val: string{lit}): ptr gcc_jit_rvalue =
+  jitCtx.ctx.gcc_jit_context_new_string_literal(val)
+
+proc toRValue(jitCtx: JitContext, val: cstring): ptr gcc_jit_rvalue =
+  jitCtx.ctx.gcc_jit_context_new_string_literal(val)
 
 proc toRValue(val: ptr gcc_jit_param): ptr gcc_jit_rvalue =
   gcc_jit_param_as_rvalue(val)
 
-proc toRValue(ctx: ptr gcc_jit_context, val: ptr gcc_jit_param): ptr gcc_jit_rvalue =
+proc toRValue(jitCtx: JitContext, val: ptr gcc_jit_param): ptr gcc_jit_rvalue =
   # version ignoring context
   gcc_jit_param_as_rvalue(val)
 
 proc toRValue(val: ptr gcc_jit_lvalue): ptr gcc_jit_rvalue =
   gcc_jit_lvalue_as_rvalue(val)
 
-proc toRValue(ctx: ptr gcc_jit_context, val: ptr gcc_jit_lvalue): ptr gcc_jit_rvalue =
+proc toRValue(jitCtx: JitContext, val: ptr gcc_jit_lvalue): ptr gcc_jit_rvalue =
   # version ignoring the context
   gcc_jit_lvalue_as_rvalue(val)
 
 # no-op
-proc toRValue(ctx: ptr gcc_jit_context, val: ptr gcc_jit_rvalue): ptr gcc_jit_rvalue = val
+proc toRValue(jitCtx: JitContext, val: ptr gcc_jit_rvalue): ptr gcc_jit_rvalue = val
 
-proc toRValue[T](ctx: ptr gcc_jit_context, val: T): ptr gcc_jit_rvalue =
+proc toRValue[T: not openArray](jitCtx: JitContext, val: T): ptr gcc_jit_rvalue =
   when T is SomeInteger:
     when sizeof(T) <= 4:
-      ctx.gcc_jit_context_new_rvalue_from_int(ctx.toJitType(typeof(val)), val.cint)
+      jitCtx.ctx.gcc_jit_context_new_rvalue_from_int(jitCtx.toJitType(typeof(val)), val.cint)
     else:
-      ctx.gcc_jit_context_new_rvalue_from_long(ctx.toJitType(typeof(val)), val.clonglong)
+      jitCtx.ctx.gcc_jit_context_new_rvalue_from_long(jitCtx.toJitType(typeof(val)), val.clonglong)
   elif T is SomeFloat:
-    ctx.gcc_jit_context_new_rvalue_from_double(ctx.toJitType(typeof(val)), val.cdouble)
+    jitCtx.ctx.gcc_jit_context_new_rvalue_from_double(jitCtx.toJitType(typeof(val)), val.cdouble)
   elif T is bool:
-    ctx.gcc_jit_context_new_rvalue_from_int(ctx.toJitType(typeof(val)), if val: 1.cint else: 0.cint)
+    jitCtx.ctx.gcc_jit_context_new_rvalue_from_int(jitCtx.toJitType(typeof(val)), if val: 1.cint else: 0.cint)
+  elif T is ptr gcc_jit_rvalue:
+    val # no-op
+  #elif T is string:
+  #  ctx.
+  #elif T is openArray:
+  #  doAssert val.len == 1
+  #  ctx.toRValue(val[0])
   else:
     doAssert false, "Type " & $T & " is not supported yet."
 
-#proc toRValue[T](ctx: ptr gcc_jit_context, val: T): ptr gcc_jit_rvalue =
+#proc toRValue[N: static int; T](jitCtx: JitContext, val: array[N, T]): array[N, ptr gcc_jit_rvalue] =
+#  result = default(array[N, ptr gcc_jit_rvalue])
+#  for i, ch in val:
+#    result[i] = ctx.toRValue(ch)
 
-#proc toRValue[T](ctx: ptr gcc_jit_context, val: T): ptr gcc_jit_rvalue =
+proc toRValue[T: string](jitCtx: JitContext, val: openArray[T]): seq[ptr gcc_jit_rvalue] =
+  result = newSeq[ptr gcc_jit_rvalue](val.len)
+  for i, ch in val:
+    result[i] = jitCtx.toRValue(ch)
 
-proc newFunction[T](ctx: ptr gcc_jit_context, name: string,
+#proc toRValue[T](jitCtx: JitContext, val: T): ptr gcc_jit_rvalue =
+
+#proc toRValue[T](jitCtx: JitContext, val: T): ptr gcc_jit_rvalue =
+
+proc getFieldAsRValue[T](jitCtx: JitContext, obj: ptr gcc_jit_rvalue, typ: typedesc[T], field: string): ptr gcc_jit_rvalue =
+  ## returns the field `field` of the given `obj`, assuming it's of type `typ`.
+  doAssert $T in jitCtx.types, "The type " & $T & " does not exist in the JitContext types!"
+  let jitTyp = jitCtx.types[$T]
+  let fld = jitTyp.`fields`[field]
+  result = gcc_jit_rvalue_access_field(obj, nil, fld)
+
+proc addReturn(blck: ptr gcc_jit_block) =
+  gcc_jit_block_end_with_void_return(blck, nil)
+
+proc addReturn[T](jitCtx: JitContext, blck: ptr gcc_jit_block, res: T) =
+  gcc_jit_block_end_with_return(blck, nil, jitCtx.toRValue(res))
+
+proc addReturn(ctx: Context, res: NimNode): NimNode =
+  let blck = ctx.blckStack.head()
+  if res.kind == nnkEmpty:
+    result = genAst(blck):
+      addReturn(blck)
+  else:
+    result = genAst(blck, res):
+      JitCtx.addReturn(blck, res)
+
+proc newFunction[T](jitCtx: JitContext, name: string,
                     retType: typedesc[T],
                     params: seq[ptr gcc_jit_param],
                     functionKind: gcc_jit_function_kind,
@@ -165,43 +278,53 @@ proc newFunction[T](ctx: ptr gcc_jit_context, name: string,
   #for f, v in fields(params):
   #  params.add ctx.toParam(typeof(v), f)
   let variadic = if isVariadic: 1.cint else: 0.cint
-  ctx.gcc_jit_context_new_function(nil,
+  let paramsAddr = if params.len == 0: nil else: params[0].addr
+  jitCtx.ctx.gcc_jit_context_new_function(nil,
                                    functionKind,
-                                   ctx.toJitType(retType), # return type
+                                   jitCtx.toJitType(retType), # return type
                                    name,
-                                   params.len.cint, params[0].addr,
+                                   params.len.cint, paramsAddr,
                                    variadic)
 
-proc newBinaryOp[T; U; V; W](ctx: ptr gcc_jit_context,
+proc newContextCall(jitCtx: JitContext, fn: ptr gcc_jit_function,
+                    args: seq[ptr gcc_jit_rvalue]): ptr gcc_jit_rvalue =
+  let numArgs = args.len
+  jitCtx.ctx.gcc_jit_context_new_call(nil,
+                                      fn,
+                                      numArgs.cint, args[0].addr)
+
+proc addEval(blck: ptr gcc_jit_block, contextCall: ptr gcc_jit_rvalue) =
+  ## Adds an evaluation to the given `blck` with the given `contextCall`, which
+  ## should be the result of a call to `newContextCall`
+  gcc_jit_block_add_eval(blck, nil, contextCall)
+
+proc newBinaryOp[T; U; V; W](jitCtx: JitContext,
                              op: T,
                              resType: typedesc[U],
                              aJ: V, bJ: W): ptr gcc_jit_rvalue =
   when T is gcc_jit_comparison:
-    ctx.gcc_jit_context_new_comparison(nil, op, ctx.toRValue(aJ), ctx.toRValue(bJ))
+    jitCtx.ctx.gcc_jit_context_new_comparison(nil, op, jitCtx.toRValue(aJ), jitCtx.toRValue(bJ))
   elif T is gcc_jit_binary_op:
-    ctx.gcc_jit_context_new_binary_op(nil, op, ctx.toJitType(type(resType)),
-                                      ctx.toRValue(aJ),
-                                      ctx.toRValue(bJ))
+    jitCtx.ctx.gcc_jit_context_new_binary_op(nil, op, jitCtx.toJitType(type(resType)),
+                                      jitCtx.toRValue(aJ),
+                                      jitCtx.toRValue(bJ))
   else:
     doAssert false, "not supported and does not make sense " & $T
 
-
-#template jitBlock(): untyped =
-
 template setupContext(): untyped {.dirty.} =
-  var JitCtx: ptr gcc_jit_context
+  var JitCtx = JitContext()
   var res: ptr gcc_jit_result
 
   # Get a "context" object for working with the library.  */
-  JitCtx = gcc_jit_context_acquire()
-  if JitCtx.isNil:
+  JitCtx.ctx = gcc_jit_context_acquire()
+  if JitCtx.ctx.isNil:
     echo "nil JitCtx"
     return 1
 
   # Set some options on the context.
   #  Let's see the code being generated, in assembler form.  */
   gcc_jit_context_set_bool_option(
-    JitCtx,
+    JitCtx.ctx,
     GCC_JIT_BOOL_OPTION_DUMP_GENERATED_CODE,
     0)
 
@@ -234,7 +357,7 @@ macro fnRetType(t: typed): untyped =
 #  for i in 1 ..< params.len:
 #    echo params[i].treerepr
 
-#template toJitFn[T: proc](ctx: ptr gcc_jit_context, fn: T, functionKind: gcc_jit_function_kind): ptr gcc_jit_function =
+#template toJitFn[T: proc](ctx: JitContext, fn: T, functionKind: gcc_jit_function_kind): ptr gcc_jit_function =
 #  fnParams(fn)
 #  ctx.newFunction(astToStr(fn), fnRetType(fn),
 #  5
@@ -244,7 +367,7 @@ proc greet2(name: cstring): void = # {.jit.} =
   let x = "cant believe".cstring
   c_printf("hello freaking wowza %s %s\n", x, name)
 
-proc createCode(ctx: ptr gcc_jit_context) =
+proc createCode(jitCtx: JitContext) =
   #[ Let's try to inject the equivalent of:
      void
      greet (const char *name)
@@ -254,22 +377,22 @@ proc createCode(ctx: ptr gcc_jit_context) =
   ]#
   #let voidType = gcc_jit_context_get_type(ctx, toJitType(void))
   #let const_char_ptr_type = gcc_jit_context_get_type(ctx, toJitType(ptr char))
-  let param_name = ctx.toParam(ptr char, "name")
-  let fn = ctx.newFunction("greet", void, @[param_name], GCC_JIT_FUNCTION_EXPORTED)
+  let param_name = jitCtx.toParam(ptr char, "name")
+  let fn = jitCtx.newFunction("greet", void, @[param_name], GCC_JIT_FUNCTION_EXPORTED)
   #let fn = ctx.toJitFn(greet2, GCC_JIT_FUNCTION_EXPORTED)
 
-  let param_format = ctx.toParam(ptr char, "format")
-  let printf_func = ctx.newFunction("printf", int32, @[param_format],
-                                   GCC_JIT_FUNCTION_IMPORTED,
-                                   isVariadic = true)
-  let args = [ctx.toRValue("hello %s\n"), gcc_jit_param_as_rvalue(param_name)]
+  let param_format = jitCtx.toParam(ptr char, "format")
+  let printf_func = jitCtx.newFunction("printf", int32, @[param_format],
+                                       GCC_JIT_FUNCTION_IMPORTED,
+                                       isVariadic = true)
+  let args = [jitCtx.toRValue("hello %s\n"), gcc_jit_param_as_rvalue(param_name)]
 
   ## Add the body to the function
   let blck = gcc_jit_function_new_block(fn, nil)
   ## evaluate the body
   gcc_jit_block_add_eval(
     blck, nil,
-    gcc_jit_context_new_call(ctx,
+    gcc_jit_context_new_call(jitCtx.ctx,
                              nil,
                              printf_func,
                              2, args[0].addr))
@@ -283,7 +406,7 @@ proc genParam(n, name, typ: NimNode): NimNode =
 proc genParamName(n: NimNode): NimNode =
   result = ident(n.strVal & "_PARAM")
 
-{.experimental: "dynamicBindSym".}
+# {.experimental: "dynamicBindSym".}
 proc isParam(n: NimNode, jitParams: seq[(string, NimNode)]): bool =
   case n.kind
   of nnkSym, nnkIdent:
@@ -318,15 +441,17 @@ proc buildArgs(ctx: Context, n: NimNode): NimNode =
       let param = paramOpt.get
       rval = genAst(p = param):
         toRValue(p)
+      result.add rval
     else:
       let argCall = ctx.generateBody(n[i]) # getVarName(n[i])
+      ## Might return a `nnkBracket`, but that should be fine!
       rval = genAst(arg = argCall):
         JitCtx.toRValue(arg)
-    result.add rval
+      result.add rval
 
 proc newLocal(ctx: Context, ident: NimNode): NimNode =
   let name = ident[0].strVal
-  let lval = ctx.generateBody(ident[0]) # ident(name & "_LVALUE")
+  let lval = ctx.generateBody(ident[0])
   let typ  = ident[2].getType
   ## `rval` has to be "treated" (might be a call for example)
   withRValue(ctx):
@@ -362,38 +487,26 @@ proc generateBody(ctx: Context, body: NimNode): NimNode =
     case body[1].kind
     of nnkLiterals: result = body
     of nnkIdent, nnkSym: result = ctx.generateBody(body[1])
-    else: doAssert false, "not supported " & $body.repr
-  of nnkCall:
+    of nnkBracket:
+      result = nnkBracket.newTree() #newStmtList()
+      for ch in body[1]:
+        result.add ctx.generateBody(ch)
+    of nnkDotExpr: result = ctx.generateBody(body[1])
+    else: doAssert false, "not supported " & $body.treerepr
+  of nnkCommand, nnkCall:
     # perform a call
     # Note: this implies it is of `void` return type, otherwise we
     # would have seen let / var / asgn
     # 1. first a new block
     let fnCall = ident(body[0].strVal & "_SYMBOL")
     let args = ctx.buildArgs(body)
-    let numArgs = args.len
-    let argsIdent = ident"args"
     ## XXX: thanks to discardable we can't use `geType` to determine if we need `add_eval`
-    var call: NimNode
     if not ctx.nextCallRvalue:
-      let argDef = genAst(aId = argsIdent, a = args):
-        let aId = a
-      call = genAst(fn = ctx.fn, fnCall, numArgs, aId = argsIdent, blck = ctx.blckStack.head):
-        gcc_jit_block_add_eval(
-          blck, nil,
-          gcc_jit_context_new_call(JitCtx, nil,
-                                   fnCall,
-                                   numArgs, aId[0].addr)
-        )
-      result = newStmtList(argDef, call)
+      result = genAst(args, fnCall, blck = ctx.blckStack.head):
+        addEval(blck, JitCtx.newContextCall(fnCall, flatten(@args)))
     else:
-      #let argDef = genAst(aId = argsIdent, a = args):
-      #  let aId = a
-      result = genAst(a = args, fn = ctx.fn, fnCall, numArgs, aId = argsIdent, blck = ctx.blckStack.head):
-        block:
-          let aId = a
-          gcc_jit_context_new_call(JitCtx, nil,
-                                   fnCall,
-                                   numArgs, aId[0].addr)
+      result = genAst(args, fnCall, blck = ctx.blckStack.head):
+        JitCtx.newContextCall(fnCall, flatten(@args))
   of nnkStmtListExpr, nnkStmtList:
     ## XXX: if `expr` need to return something in theory!! only `printf` returns int that is discardable
     result = newStmtList()
@@ -406,12 +519,11 @@ proc generateBody(ctx: Context, body: NimNode): NimNode =
   of nnkReturnStmt:
     # return the given value
     doAssert body[0].kind == nnkAsgn, "Weird, return isn't asgn ? " & $body.treerepr
+    ctx.hasExplicitReturn = true
     # return the child [1]
     let resVar = body[0][1]
     let resJitVal = ctx.generateBody(resVar)
-    result = genAst(blck = ctx.blckStack.head, res = resJitVal):
-      gcc_jit_block_end_with_return(blck, nil,
-                                    JitCtx.toRValue(res))
+    result.add ctx.addReturn(resJitVal)
   of nnkInfix:
     ## generate an infix RVALUE
     let op = toJitInfix(body)
@@ -505,22 +617,45 @@ proc generateBody(ctx: Context, body: NimNode): NimNode =
     doAssert ctx.blckStack.len == 1
     discard ctx.blckStack.pop() # pop the initial current block
     ctx.blckStack.add afterIfBlck # add the after block as the new base block
+  of nnkDotExpr:
+    ## XXX: need to know if this is an lvalue or an rvalue!
+    let xS = ctx.generateBody(body[0])
+    result = genAst(x = xS, sym = body[0], fieldName = body[1].strVal):
+      JitCtx.getFieldAsRValue(JitCtx.toRValue(x), type(sym), fieldName)
+  #of nnkForStmt:
+  #  echo body.treerepr
+  #
+  #  doAssert false
+  of nnkCommentStmt: result = body ## just keep them as is
   else:
     doAssert false, "notsupported yet " & $body.kind
 
 proc jitFn(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = false): NimNode
 
-proc jitCalledFns(n: NimNode): NimNode =
+## XXX: implement `echo` by importing `echoBinSafe`, which has signature
+## `proc echoBinSafe(x: array[string], numArgs: int)`
+## or something like that
+#proc echoJit(): NimNode =
+#  let params = @[JitCtx.toParam(type(ptr cstring), "x"),
+#                 JitCtx.toParam(type(cint), "num")] # number of elements in array
+#  let fnS = JitCtx.newFunction("echoBinSafe", type(void), params, GCC_JIT_FUNCTION_IMPORTED, isVariadic = false)
+
+
+proc jitCalledFns(ctx: Context, n: NimNode): NimNode =
   ## NOTE: This could become a pre pass that also registers the kind of returns
   ## as well as checks for what kind of code flow we have?
   result = newStmtList()
-  if n.kind == nnkCall:
-    if n[0].strVal == "foo": ## XXX: DETERMINE BASED ON IMPORTC?
-      result.add jitFn(toImpl(n[0]), GCC_JIT_FUNCTION_EXPORTED)
-    else:
-      result.add jitFn(toImpl(n[0]), GCC_JIT_FUNCTION_IMPORTED)
+  if n.kind in {nnkCall, nnkCommand}:
+    let nStr = n[0].strVal
+    if nStr notin ctx.seenFns:
+      if n[0].strVal in ["foo"]: ## XXX: DETERMINE BASED ON IMPORTC?
+        result.add jitFn(toImpl(n[0]), GCC_JIT_FUNCTION_EXPORTED)
+      else:
+        result.add jitFn(toImpl(n[0]), GCC_JIT_FUNCTION_IMPORTED)
+      ctx.seenFns.incl nStr
+    # else nothing to do
   for stmt in n:
-    let res = jitCalledFns(stmt)
+    let res = ctx.jitCalledFns(stmt)
     if res.len > 0:
       result.add res
 
@@ -558,11 +693,16 @@ proc jitFn(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = fals
   var ctx = Context()
   if setupContext:
     result.add getAst(setupContext())
-  let retParam = params[0]
+  let retParam = if params[0].kind == nnkEmpty: ident("void") else: params[0]
   var jitParams = newSeq[(string, NimNode)]()
+  var anyArgumentVarargs = false
   for i in 1 ..< params.len: # skip 0, return, will be used later
     let p = params[i]
     let pType = p[params.len - 1] # second to last is return type
+    ## XXX: handle `varargs` and conversions of the types used by `echo`, `varargs[typed, $]`
+    ## where the latter argument implies the actual type via a call
+    if pType.kind == nnkBracketExpr and pType[0].strVal == "varargs":
+      anyArgumentVarargs = true
     for j in 0 ..< p.len - 2: # get all parameter names
       let paramName = genParamName(p[j])
       jitParams.add (p[j].strVal, paramName)
@@ -576,7 +716,7 @@ proc jitFn(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = fals
   var jitBr = nnkBracket.newTree()
   for p in jitParams:
     jitBr.add p[1]
-  let isVariadic = fn.hasPragma("varargs")
+  let isVariadic = fn.hasPragma("varargs") or anyArgumentVarargs
   let fnDef = genAst(fnS, fnName, retParam, jitBr, fnKind = functionKind, variadic = isVariadic):
     let fnS = JitCtx.newFunction(fnName, type(retParam), @jitBr, fnKind, isVariadic = variadic)
   result.add fnDef
@@ -586,17 +726,20 @@ proc jitFn(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = fals
   #    and recurse
   ## XXX: not only AST top level of course!
   let body = fn.body
-  result.add jitCalledFns(body)
+  result.add ctx.jitCalledFns(body)
   # 4. generate body of this procedure to be evaluated
   # 4a. generate the block of code for the body
   ## Generate the block for the body & add it to our stack of blocks
   result.add ctx.newBlock("blck_body_" & fnSymbolName, fnS)
   # result.add varBlock
   result.add ctx.generateBody(body)
+  if not ctx.hasExplicitReturn:
+    ## XXX: change this to automatically return `result` varialbe instead of void!
+    result.add ctx.addReturn(newEmptyNode())
 
   let dump = genAst(fnS, fnName):
     gcc_jit_function_dump_to_dot(fnS, "/tmp/test.dot")
-  result.add dump
+  #result.add dump
   echo "============================== JIT FN", result.repr
 
 macro jit(fn: typed): untyped =
@@ -604,27 +747,56 @@ macro jit(fn: typed): untyped =
   echo fn.treerepr, "^^^^^^^^^^^"
   result = jitFn(toImpl(fn), GCC_JIT_FUNCTION_EXPORTED, setupContext = true)
 
-proc greet(name: cstring): void = # {.jit.} =
+proc greet(name: cstring): void =
   let x = "cant believe".cstring
   let y = 5
   c_printf("hello freaking wowza %s %s %i\n", x, name, y)
 
 proc foo(a, b: int): int = return a + b
 
+#proc print
+template print(args: varargs[untyped]): untyped = c_printf(args)
+
+type
+  Bar = object
+    x: int
+    y: int
+    s: cstring
+
 proc greetInt(name: cstring): int = # {.jit.} =
-  let x = "cant believe".cstring
+  # Note: types like `string` work due to auto conversion of string->cstring?
+  let x = "cant believe" #.cstring
   let y = 5
   let a = true
-  let b = 3 >= y
+  let b = 8 >= y
   if b:
-    discard c_printf("hello freaking wowza %s %s %i and 5>y? %i \n", x, name, y, b)
+    print "hello freaking wowza %s %s %i and 5>y? %i \n", x, name, y, b
   else:
     #discard c_printf("unfortunately not allowed to print, condition 5>y not held\n")
     #discard # 5
     let w = 1
+
+  ## XXX: this gives redefiniton errors currently! Gensym our variables!
+  ## One issue: mapping later symbols to earlier ones! If we gensym naively
+  ## we will generate the wrong symbols in later usages!
+  ## Currently mainly the generated `args` are affected. Do we even need to
+  ## generate them?
+  print "hello\n"
+
+  #for i in 0 ..< 3:
+  # let els = [1, 2, 3]
+  #for i in els:
+  #  print("%i ", i)
+
   let z = foo(1, y + 2)
   let z2 = 2 * z
   return z
+
+proc handBar(b: Bar) =
+  print("%i and %i with the name: %s\n", b.x, b.y, b.s)
+
+proc test(): int =
+  echo("hello", " world")
 
 import std/syncio
 proc main(): int =
@@ -633,17 +805,21 @@ proc main(): int =
   #
   ## Populate the context.  */
   #create_code(ctx)
-  jit(greetInt)
+  #jit(greetInt)
+  #jit(test)
+  jit(handBar)
 
   # Compile the code.  */
-  res = gcc_jit_context_compile(JitCtx)
+  res = gcc_jit_context_compile(JitCtx.ctx)
   if res.isNil:
     echo "nil result"
     return 1
   # Extract the generated code from "result".
   type
     fnType = proc(c: cstring) {.nimcall.}
+    fnTypeNone = proc(): clonglong {.nimcall.}
     fnTypeInt = proc(c: cstring): clonglong {.nimcall.}
+    fnTypeBar = proc(c: Bar) {.nimcall.}
   when false:
     var greet = cast[fnType](gcc_jit_result_get_code(res, "greet"))
     if greet.isNil:
@@ -651,16 +827,31 @@ proc main(): int =
       return 1
     # Now call the generated function: */
     greet("world")
-  else:
+  elif false:
     var greetInt = cast[fnTypeInt](gcc_jit_result_get_code(res, "greetInt"))
     if greetInt.isNil:
       echo "nil greetInt"
       return 1
     # Now call the generated function: */
     echo "Funtion returns: ", greetInt("world")
+  elif true:
+    var handBar = cast[fnTypeBar](gcc_jit_result_get_code(res, "handBar"))
+    if handBar.isNil:
+      echo "nil handBar"
+      return 1
+    # Now call the generated function: */
+    let bar = Bar(x: 5, y: 10, s: "world")
+    handBar(bar)
+  else:
+    var test = cast[fnTypeNone](gcc_jit_result_get_code(res, "test"))
+    if test.isNil:
+      echo "nil test"
+      return 1
+    # Now call the generated function: */
+    echo "Funtion returns: ", test()
   stdout.flushFile()
 
-  gcc_jit_context_release(JitCtx)
+  gcc_jit_context_release(JitCtx.ctx)
   gcc_jit_result_release(res)
 
 when isMainModule:
