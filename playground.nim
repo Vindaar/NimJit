@@ -630,7 +630,7 @@ proc generateBody(ctx: Context, body: NimNode): NimNode =
   else:
     doAssert false, "notsupported yet " & $body.kind
 
-proc jitFn(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = false): NimNode
+proc jitFn*(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = false): NimNode
 
 ## XXX: implement `echo` by importing `echoBinSafe`, which has signature
 ## `proc echoBinSafe(x: array[string], numArgs: int)`
@@ -685,7 +685,7 @@ proc getName(fn: NimNode): string =
   else:
     result = fn.name.strVal
 
-proc jitFn(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = false): NimNode =
+proc jitFn*(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = false): NimNode =
   let params = fn.params
   echo "============================== ", fn.treerepr
   # 1. generate params
@@ -742,7 +742,7 @@ proc jitFn(fn: NimNode, functionKind: gcc_jit_function_kind, setupContext = fals
   #result.add dump
   echo "============================== JIT FN", result.repr
 
-macro jit(fn: typed): untyped =
+macro jit*(fn: typed): untyped =
   echo "--------------------------------------------------------"
   echo fn.treerepr, "^^^^^^^^^^^"
   result = jitFn(toImpl(fn), GCC_JIT_FUNCTION_EXPORTED, setupContext = true)
