@@ -1,0 +1,60 @@
+* NimJit
+
+** Compiler patch
+
+Requires the following compiler patch for the time being:
+#+begin_src 
+diff --git a/compiler/nimeval.nim b/compiler/nimeval.nim
+index 82e2f0812..3be5063a8 100644
+--- a/compiler/nimeval.nim
++++ b/compiler/nimeval.nim
+@@ -17,9 +17,9 @@ import
+ type
+   Interpreter* = ref object ## Use Nim as an interpreter with this object
+     mainModule: PSym
+-    graph: ModuleGraph
++    graph*: ModuleGraph
+     scriptName: string
+-    idgen: IdGenerator
++    idgen*: IdGenerator
+ 
+ iterator exportedSymbols*(i: Interpreter): PSym =
+   assert i != nil
+@@ -104,7 +104,7 @@ proc findNimStdLibCompileTime*(): string =
+ proc createInterpreter*(scriptName: string;
+                         searchPaths: openArray[string];
+                         flags: TSandboxFlags = {},
+-                        defines = @[("nimscript", "true")],
++                        defines = @[("nimscript", "false")],
+                         registerOps = true): Interpreter =
+   var conf = newConfigRef()
+   var cache = newIdentCache()
+@@ -113,8 +113,17 @@ proc createInterpreter*(scriptName: string;
+   initDefines(conf.symbols)
+   for define in defines:
+     defineSymbol(conf.symbols, define[0], define[1])
++  conf.selectedGC = gcOrc ## <-- this is what's needed to get destructors working!
++  defineSymbol(conf.symbols, "gcorc")
++  defineSymbol(conf.symbols, "gcdestructors")
++  incl conf.globalOptions, optSeqDestructors
++  incl conf.globalOptions, optTinyRtti
++  defineSymbol(conf.symbols, "nimSeqsV2")
++  defineSymbol(conf.symbols, "nimV2")
++  defineSymbol(conf.symbols, "danger")
++  defineSymbol(conf.symbols, "release")
+   registerPass(graph, semPass)
+-  registerPass(graph, evalPass)
++  #registerPass(graph, evalPass)
+ 
+   for p in searchPaths:
+     conf.searchPaths.add(AbsoluteDir p)
+@@ -124,7 +133,7 @@ proc createInterpreter*(scriptName: string;
+   incl(m.flags, sfMainModule)
+   var idgen = idGeneratorFromModule(m)
+   var vm = newCtx(m, cache, graph, idgen)
+-  vm.mode = emRepl
++  #vm.mode = emRepl
+   vm.features = flags
+   if registerOps:
+     vm.registerAdditionalOps() # Required to register parts of stdlib modules
+#+end_src
