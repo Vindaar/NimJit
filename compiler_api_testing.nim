@@ -451,14 +451,14 @@ iterator fieldTypes(n: PNode): (string, PNode) =
   let rec = n[2][2]
   for i in 0 ..< rec.len:
     let ch = rec[i]
-    doAssert ch.kind == nkIdentDefs
+    doAssert ch.kind == nkIdentDefs, "Unexpected, wanted `nkIdentDefs`, but got " & $ch.treerepr
     ## We yield the node so that we can later extract the type as we please from the `PNode`
     yield (ch[0].getName(), ch[1])
 
 iterator fieldTypes(typ: PType): (string, PNode) = #PType) =
   ## yields the name of each object field and the type as a string
   ## XXX: rewrite implemntation to use `PType`!
-  echo typ.kind, " of ", typ.sym.ast.treerepr
+  echo typ.kind, " of ", typ.sym.ast.treerepr, " rendered: ", typ.sym.ast.renderTree()
   for (name, sym) in fieldTypes(typ.sym.ast.getTypeImpl):
     yield (name, sym)
   #for (i, son) in typ.sons:
@@ -670,6 +670,7 @@ proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
         jitType.typ = toPtrType(result)
         jitCtx.types[typName] = jitType
       else:
+        echo jitCtx.intr.performTransformation(typ.sym).ast.renderTree()
         for field, val in fieldTypes(typ):
           let jitField = jitCtx.newField(val, field)
           jitType.`fields`[field] = jitField
@@ -703,6 +704,14 @@ proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
     ## XXX: use something similar to `nlvm` of having types we don't care about
     ## "irrelevant for backend" and consider using `skipTypes`
     #echo typ.skipTypes({tyGenericInst, tyObject}).kind
+    result = jitCtx.toJitType(typ.lastSon())
+  of tyAlias, tyDistinct:
+    result = jitCtx.toJitType(typ.lastSon())
+  of tyEnum:
+    ## XXX: hack!!!
+    result = jitCtx.newType(tyInt)
+  of tyRange:
+    ## XXX: HACK!!!
     result = jitCtx.toJitType(typ.lastSon())
   of tyGenericParam:
     ## XXX: we have the problem that for an `openArray[string]` the type of `ptr string`
@@ -1099,6 +1108,7 @@ proc newLocalAsgn(ctx: JitContext, ident: PNode): JitNode =
     withRValue(ctx):
       let rval = ctx.genNode(ident[2])
     # now assign rval to lval
+    echo "RVAL: ", rval
     ctx.assign(result, rval)
   # else this was a `var` section *without* an initialization
 
@@ -1197,7 +1207,11 @@ proc jumpWithCond(ctx: JitContext, condNode: PNode) = #ifStmt, cond, ifTrue, ifF
 proc deref(ctx: JitContext, n: PNode): JitNode =
   ## Dereferences `n` (an rvalue) and returns the dereferenced value as an
   ## `lvalue`.
-  let jitNode = ctx.genNode(n[0])
+  echo "DEREF : ", n.treerepr
+  ## XXX: I think the `n[0]` here is generally not correct! `n` might be an `nkStmtListExpr` in
+  ## which case we need to deref the last element.
+  let jitNode = ctx.genNode(n)
+  echo "NODE ?? ", jitNode
   result = toJitNode(gcc_jit_rvalue_dereference(ctx.toRValue(jitNode), nil))
 
 proc address(n: JitNode): JitNode =
@@ -1224,7 +1238,7 @@ proc buildArgs(ctx: JitContext, fnName: string, n: PNode): JitNode =
     let param = fnParams[min(i-1, fnParams.high)]
     withRValue(ctx):
       let arg = ctx.genNode(n[i])
-    echo "ARGUMENT: ", arg, " for body ", n[i].treerepr, " for param: ", param[0], "  ", param[1], "  ", param[2].treerepr
+    #echo "ARGUMENT: ", arg, " for body ", n[i].treerepr, " for param: ", param[0], "  ", param[1], "  ", param[2].treerepr
     if param[2].isHiddenPointer:
       # get the address of the argument & turn it back into RValue
       result.add toJitNode(ctx.toRValue(address(arg)), n[i].renderTree())
@@ -1238,6 +1252,8 @@ proc genStringToCString(ctx: JitContext, n: PNode): JitNode =
   #                              "NimStringV2", "p")
   ## XXX: differentiate between need to deref `n[0]` if `n[0]` is already
   ## a `deref` call!
+  echo "CSTRING OF ", n[0].treerepr
+  echo n[0].renderTree()
   let strPayload = ctx.getFieldAsRValue(ctx.toRValue(ctx.deref(n[0])),
                                         "NimStringV2", "p")
   result = ctx.getFieldAsRValue(toPtrRValue(strPayload),
@@ -1272,6 +1288,10 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
   ## XXX: would have to generate blocks before hand so we can actually jump!
   ## execute the real code (and partially store in the JitContext!)
   #echo body.treerepr, " ============= ", body.renderTree()
+  echo "==============================\n", body.renderTree(), "------------------------------"
+
+  ## XXX: Need to learn about the different `flags` used in the AST. nlvm and the regular cgen
+  ## uses those a lot to decide how to handle things.
 
   ## XXX: do we need to manually check if e.g. `len(args)` is called for an
   ## `openArray[T]` call, due to our rewriting of `openArray` as `ptr T, len` arguments?
@@ -1301,24 +1321,32 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
       for ch in body[1]:
         result.add ctx.genNode(ch)
     of nkDotExpr: result = ctx.genNode(body[1])
-    of nkStringToCString: result = ctx.genStringToCstring(body[1])
+    of nkStringToCString: result = ctx.genNode(body[1])
     else: doAssert false, "not supported " & $body.treerepr & " rendered: " & body.renderTree()
+  of nkConv: ## XXX: handle `nkConv` correctly!
+    result = ctx.genNode(body[1])
   of nkCommand, nkCall:
     # perform a call
     # Note: this implies it is of `void` return type, otherwise we
     # would have seen let / var / asgn
     # 1. first a new block
     let fnName = body[0].getName()
-    echo "CALL FN ", fnName
+    echo "CALL FN ", fnName, " with rvalue? ", ctx.nextCallRValue
     let fnCall = ctx.getFunction(body[0])
     let args = ctx.buildArgs(fnName, body)
     ## XXX: thanks to discardable we can't use `geType` to determine if we need `add_eval`
-    #echo "Constructing call: ", fnName, " with RValue? ", ctx.nextCallRValue
+    ## - check for `sfDiscardable` somewhere? Not useful here though
+    echo "Constructing call: ", fnName, " with RValue? ", ctx.nextCallRValue
     if not ctx.nextCallRvalue:
       addEval(ctx.blckStack.head(), ctx.newContextCall(fnCall, toRaw(args)))
     else:
       result = ctx.newContextCall(fnCall, toRaw(args))
-  of nkStmtListExpr, nkStmtList:
+  of nkStmtListExpr:
+    ## XXX: if `expr` need to return something in theory!! only `printf` returns int that is discardable
+    ## XXX:Check that this is correct!!!
+    for stmt in body: # last element is return?
+      result = ctx.genNode(stmt)
+  of nkStmtList:
     ## XXX: if `expr` need to return something in theory!! only `printf` returns int that is discardable
     result = initJitNode(jtSeq)
     for stmt in body:
@@ -1424,18 +1452,20 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
     let xS = ctx.genNode(body[0])
     result = ctx.getFieldAsRValue(ctx.toRValue(xS), body[0], body[1].getName())
   of nkCommentStmt: result = initJitNode(jtEmpty) # ignore
-  of nkFastAsgn:
-    # handle as `nkAsgn`?
-    ## XXX: for now this seems to me to happen in cases like:
-    ## FastAsgn
-    ## 0/1  Symi sk:ForVar ty:Int flags:{sfUsed, sfCursor} ty:Int sk:Type
-    ## 1/1  Symi sk:Var ty:Int flags:{sfUsed, sfFromGeneric} ty:Int sk:Type
-    ## where it maps a for var to a regular var. We'll try to just ignore those.
-    discard
-  of nkAsgn:
+  #of nkFastAsgn: discard
+  #  # handle as `nkAsgn`?
+  #  ## XXX: for now this seems to me to happen in cases like:
+  #  ## FastAsgn
+  #  ## 0/1  Symi sk:ForVar ty:Int flags:{sfUsed, sfCursor} ty:Int sk:Type
+  #  ## 1/1  Symi sk:Var ty:Int flags:{sfUsed, sfFromGeneric} ty:Int sk:Type
+  #  ## where it maps a for var to a regular var. We'll try to just ignore those.
+  #  discard
+  of nkAsgn, nkFastAsgn:
     # perform assignment
+    echo "ASSIGNING ", body[1].renderTree, " to ", body[0].renderTree()
     let lval = ctx.genNode(body[0])
-    let rval = ctx.genNode(body[1])
+    withRValue(ctx):
+      let rval = ctx.genNode(body[1])
     ctx.assign(lval, rval)
   of nkBracket:
     ## NOTE: libgccjit from ABI 19 onwards has a constructor for arrays from a
@@ -1505,7 +1535,7 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
       result = ctx.genNode(body[0])
     else:
       echo "HAVING A HIDDEN DEREFHERE : ", body.treerepr
-      result = ctx.deref(body)
+      result = ctx.deref(body[0])
   of nkAddr:
     result = ctx.genAddr(body)
   #of nkForStmt:
@@ -1530,8 +1560,40 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
   of nkCast:
     echo body.treerepr
     result = ctx.genCast(body)
+  of nkTypeSection:
+    ## XXX: DO NOT SKIP ME! ONLY FOR TESTING
+    discard
+  of nkHiddenTryStmt: ## XXX: handle as a `block`!!! FOR TESTING
+    result = initJitNode(jtSeq)
+    for stmt in body:
+      result.add ctx.genNode(stmt)
+  of nkFinally: discard ## XXX: ignore cleanup for now. TESTING!!!
+  of nkStringToCString: result = ctx.genStringToCstring(body)
+  of nkObjConstr:
+    # construct new object by:
+    # new local temp variable of type body[0]
+    # walk `exprColonExpr`
+    # each is an `assign` of the corresponding field
+    ## XXX: no final. Fix up `nil`
+    let objTyp = ctx.toJitType(body[0])
+    let varName = "tmp_var_" & $ctx.varCount
+    let loc = ctx.newLocal(objTyp, varName)
+    inc ctx.varCount
+    for i in 1 ..< body.len: # skip type 0
+      let field = body[i]
+      doAssert field.kind == nkExprColonExpr
+      let fieldTyp = ctx.toJitType(field[0])
+      let val = if field[1].kind == nkNilLit: toJitNode(ctx.ctx.gcc_jit_context_null(toPtrType(fieldTyp)), "nil")
+                else: ctx.genNode(field[1])
+      if field[1].kind != nkNilLit: # skip assignment of `null` values
+        ctx.assign(
+          ctx.getFieldAsLValue(loc, objTyp, field[0].getName()),
+          val
+        )
+    result = toJitNode(ctx.toRValue(loc), varName)
   else:
-    debug body.treerepr
+    echo body.treerepr
+    echo body.renderTree()
     doAssert false, "notsupported yet " & $body.kind
 
 ## XXX: implement `echo` by importing `echoBinSafe`, which has signature
@@ -1610,7 +1672,7 @@ proc jitFn(jitCtx: JitContext, fn: PNode): JitNode =
     return jitCtx.lookupMagic(fn)
 
   let fn = jitCtx.intr.performTransformation(fn[0].sym).ast
-
+  echo "Transformed body: ", fn.renderTree
 
   # store current information of the calling scope
   let currentNextCallRValue = jitCtx.nextCallRValue
@@ -1760,6 +1822,7 @@ proc performTransformation(intr: Interpreter, p: PSym): PSym =
   p.ast[6] = trnsf
   result = p
 
+import times
 proc jitAst(intr: Interpreter, p: PNode, name: string) =
   ## Perform JIT compilation of the given Nim AST at runtime by mapping the
   ## nodes to `libgccjit` calls.
@@ -1770,6 +1833,8 @@ proc jitAst(intr: Interpreter, p: PNode, name: string) =
   # set up a jit context
   let jitCtx = initJitContext(intr, true)
   let jitted = jitFn(jitCtx, p) # , GCC_JIT_FUNCTION_EXPORTED)
+  #jitCtx.ctx.gcc_jit_context_set_int_option(GCC_JIT_INT_OPTION_OPTIMIZATION_LEVEL, 3.cint)
+
 
   # test compile it:
   var res = gcc_jit_context_compile(jitCtx.ctx)
@@ -1789,7 +1854,10 @@ proc jitAst(intr: Interpreter, p: PNode, name: string) =
     if fn.isNil:
       echo "nil fn"
     # Now call the generated function: */
+
+    let t0 = epochTime()
     fn()
+    echo "Took ", epochTime() - t0, "s"
   stdout.flushFile()
 
   gcc_jit_context_release(jitCtx.ctx)
@@ -1879,6 +1947,11 @@ proc lookupMagic(ctx: JitContext, fn: PNode): JitNode =
   of mEcho: result = ctx.lookupCompilerProc(fnSym, "echoBinSafe")
   of mLengthStr: result = ctx.lookupStrLength(fn) #ctx.lookupLength(fnSym, "len")
   of mLengthOpenArray: result = ctx.lookupLengthOpenArray(fn) #ctx.lookupLength(fnSym, "len")
+  of mNewString:
+    echo fn.treerepr
+    var opr = fnSym
+    echo "$opr.loc.r = ", $opr.loc.r
+    result = ctx.lookupCompilerProc(fnSym, $opr.loc.r)
   else: doAssert false, "Unknown magic: " & $fnSym.magic
 
   ## XXX: looking up magic procedures should proceed as follows:
@@ -1894,7 +1967,9 @@ proc setupInterpreter(moduleName = "/t/script.nim"): Interpreter =
   paths.add std
   paths.add std & "/pure"
   paths.add std & "/core"
+  paths.add std & "/pure/collections"
   paths.add "/home/basti/.nimble/pkgs"
+  paths.add "/home/basti/CastData/ExternCode/units/src"
   result = createInterpreter(moduleName, paths, defines = @[])
 
 proc shutdownInterpreter(intr: Interpreter) =
@@ -1910,14 +1985,26 @@ proc evalString(code1, code2: string) =
   withStream(code1)
 
   ## XXX: have to apply the transformations when calling `jitFn` internally!
-  let bar = intr.selectRoutine("bar")
-  #let barT = intr.performTransformation(bar)
-  intr.jitAst(bar.ast, "bar")
+  #let bar = intr.selectRoutine("bar")
+  ##let barT = intr.performTransformation(bar)
+  #intr.jitAst(bar.ast, "bar")
+  #
+  #withStream(code2)
+  #let mm = intr.selectRoutine("testMath")
+  ##let mmT = intr.performTransformation(mm)
+  #intr.jitAst(mm.ast, "testMath")
 
+
+  #let t = intr.selectRoutine("foo")
+  #intr.jitAst(t.ast, "foo")
+
+  let t = intr.selectRoutine("test")
+  intr.jitAst(t.ast, "test")
+  #
   withStream(code2)
-  let mm = intr.selectRoutine("testMath")
-  #let mmT = intr.performTransformation(mm)
-  intr.jitAst(mm.ast, "testMath")
+  let t2 = intr.selectRoutine("test2")
+  intr.jitAst(t2.ast, "test2")
+
 
   #let fn = intr.selectRoutine("foo")
   #let t0 = epochTime()
@@ -1925,12 +2012,12 @@ proc evalString(code1, code2: string) =
   #  jitAst(fn.ast)
   # intr.performTransformation(fn)
   #echo "100 JITs took ", epochTime() - t0, "s, per JIT = ", (epochTime() - t0) / 100.0
-  echo magicsys.getCompilerProc(intr.graph, "LengthStr")
-  echo magicsys.getCompilerProc(intr.graph, "mLengthStr")
-  echo magicsys.getCompilerProc(intr.graph, "len")
-  let echoBinSafe =  magicsys.getCompilerProc(intr.graph, "echoBinSafe")
-  echo echoBinSafe.ast.treerepr
-  echo echoBinSafe.ast.renderTree()
+  #echo magicsys.getCompilerProc(intr.graph, "LengthStr")
+  #echo magicsys.getCompilerProc(intr.graph, "mLengthStr")
+  #echo magicsys.getCompilerProc(intr.graph, "len")
+  #let echoBinSafe =  magicsys.getCompilerProc(intr.graph, "echoBinSafe")
+  #echo echoBinSafe.ast.treerepr
+  #echo echoBinSafe.ast.renderTree()
   if true: quit()
 
   #let bar = intr.selectRoutine("bar")
@@ -1947,6 +2034,27 @@ proc testMathImpl(x, y: float): float =
 proc testMath*() =
   c_printf("%f\n", testMathImpl(1.34, 532.112))
 """
+
+let unchTest = """
+import unchained
+import system/ansi_c
+proc test*() =
+  let x = 5.kg•m•s⁻²
+  let z = x.toDef(g•cm•s⁻²)
+  c_printf("%f \n", z)
+  #c_printf("%s \n", $z)
+"""
+let unch2Test = """
+import unchained
+import system/ansi_c
+proc test2*() =
+  let x = 5.kg•m•s⁻²
+  let z = x.toDef(g•cm•s⁻²)
+  #c_printf("%f \n", z)
+  c_printf("%s \n", $z)
+
+"""
+
 
 let runtimeString = """
 import system/ansi_c
@@ -1997,4 +2105,16 @@ proc testNestedBlocks*(x, y: int): int =
 let x* = @[1, 2, 3]
 echo "Hello World"
 """
-evalString(runtimeString, string2)
+
+evalString(unchTest, unch2Test)
+let miniBench = """
+import system/ansi_c
+proc foo*() =
+  var x = 0.0
+  for i in 0 ..< 1_000_000_000:
+    x = x * 1.0000000001123 + 0.1
+    #x = x + 1 # fix `inc x`
+  c_printf("%f \n", x)
+"""
+
+#evalString(miniBench, runtimeString)
