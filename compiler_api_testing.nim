@@ -1329,7 +1329,8 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
     else: doAssert false, "not supported " & $body.treerepr & " rendered: " & body.renderTree()
   of nkConv: ## XXX: handle `nkConv` correctly!
     result = ctx.genNode(body[1])
-  of nkCommand, nkCall:
+  of nkCommand, nkCall, nkPrefix:
+    # NOTE: nkPrefix is just hacked for now. It should be somewhat like this, but maybe some subletly exists
     # perform a call
     # Note: this implies it is of `void` return type, otherwise we
     # would have seen let / var / asgn
@@ -1393,7 +1394,8 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
     result = ctx.genNode(body[0]) ## XXX: what should this really do? for now just ignore
   of nkEmpty:
     result = initJitNode(jtEmpty)
-  of nkIfStmt, nkIfExpr: ## XXX: same distinction as stmtListExpr and stmtList!
+  of nkIfStmt, nkWhenStmt, nkIfExpr: ## XXX: same distinction as stmtListExpr and stmtList!
+    # NOTE: `nkWhenStmt` is not really tested, just a hack for now
     result = initJitNode(jtSeq)
     ## Note: The idea to generate the correct jumps for an if are as follows:
     ## We start with the block in which the `if` resides as head of the block stack.
