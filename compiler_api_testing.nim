@@ -1,7 +1,7 @@
 import compiler/[nimeval, llstream, renderer, types, magicsys, ast,
                  transf, # for code transformation (for -> while etc)
-                 injectdestructors] # destructor injection
-
+                 injectdestructors, # destructor injection
+                 pathutils] # AbsoluteDir
 
 # probably need to import `pragmas` and `wordrecg` to get
 # `hasPragma` working
@@ -1973,7 +1973,7 @@ proc setupInterpreter(moduleName = "/t/script.nim"): Interpreter =
   paths.add std & "/core"
   paths.add std & "/pure/collections"
   paths.add "/home/basti/.nimble/pkgs"
-  paths.add "/home/basti/CastData/ExternCode/units/src"
+  #paths.add "/home/basti/CastData/ExternCode/units/src"
   result = createInterpreter(moduleName, paths, defines = @[])
 
 proc shutdownInterpreter(intr: Interpreter) =
@@ -1985,7 +1985,12 @@ template withStream(code: untyped): untyped =
   llStreamClose(stream)
 
 proc evalString(code1, code2: string) =
-  let intr = setupInterpreter()
+  echo "setting up interpreter"
+  var intr = setupInterpreter()
+
+  # add Unchained
+  # [X] Adding at runtime works just fine after the interpreter is constructed!
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/CastData/ExternCode/units/src")
   withStream(code1)
 
   ## XXX: have to apply the transformations when calling `jitFn` internally!
