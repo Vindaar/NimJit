@@ -2044,6 +2044,29 @@ proc testMath*() =
   c_printf("%f\n", testMathImpl(1.34, 532.112))
 """
 
+## XXX: currently broken due to `nkHiddenAddr`, but *ALSO* results in a libgccjit error
+# libgccjit.so: error: gcc_jit_context_new_call: mismatching types for argument 1 of function "addInt": assignment to param result (type: struct NimStringV2 * * *) from &result (type: struct NimStringV2 * * *)
+# libgccjit.so: error: gcc_jit_block_add_eval: NULL rvalue
+let strRepr = """
+import system/ansi_c
+proc test*() =
+  let x = 1
+  c_printf("%s \n", $x)
+"""
+
+
+## This leads to an effective generic, due to `$` for `float` also being `$` for `float32`
+## via a `float | float32` resulting in a `tyOr`. We need to use the arguments type to
+## deduce the correct type!
+let strReprGeneric = """
+import system/ansi_c
+proc test*() =
+  let x = 1.2343
+  c_printf("%s \n", $x)
+"""
+
+
+# Test 1 tests whether general unchained logic works
 let unchTest = """
 import unchained
 import system/ansi_c
@@ -2053,6 +2076,7 @@ proc test*() =
   c_printf("%f \n", z)
   #c_printf("%s \n", $z)
 """
+# Test 2 checks if string conversion works
 let unch2Test = """
 import unchained
 import system/ansi_c
@@ -2061,7 +2085,6 @@ proc test2*() =
   let z = x.toDef(g•cm•s⁻²)
   #c_printf("%f \n", z)
   c_printf("%s \n", $z)
-
 """
 
 
@@ -2115,7 +2138,8 @@ let x* = @[1, 2, 3]
 echo "Hello World"
 """
 
-evalString(unchTest, unch2Test)
+#evalString(unchTest, unch2Test)
+evalString(strRepr, unch2Test)
 let miniBench = """
 import system/ansi_c
 proc foo*() =
