@@ -25,6 +25,10 @@ template debug(args: varargs[typed]): untyped =
   when Debug:
     echo(args)
 
+proc numSons(t: PType): int =
+  for x in t:
+    inc result
+
 type
   FnParams = seq[(string, JitNode, PNode, PNode)]
   #               ^--- name of parameter
@@ -687,7 +691,7 @@ proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
     ## from the bracket itself?
     let typNode = jitCtx.toJitType(typ.lastSon()) #jitCtx.toJitType(typ)
     let name = typ.typeToString()
-    result = jitCtx.newArrayType(typNode, name, typ.sons.len)
+    result = jitCtx.newArrayType(typNode, name, typ.numSons)
   of tyVar, tyRef, tyPtr:
     ## type is pointer to n[0]
     #echo typ.sym.ast.treerepr
