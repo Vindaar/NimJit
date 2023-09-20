@@ -677,7 +677,7 @@ proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
         jitType.typ = toPtrType(result)
         jitCtx.types[typName] = jitType
       else:
-        echo jitCtx.intr.performTransformation(typ.sym).ast.renderTree()
+        #echo jitCtx.intr.performTransformation(typ.sym).ast.renderTree()
         for field, val in fieldTypes(typ):
           let jitField = jitCtx.newField(val, field)
           jitType.`fields`[field] = jitField
