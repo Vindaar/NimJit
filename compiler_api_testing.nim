@@ -274,7 +274,7 @@ proc getImpl(n: PNode): PNode =
   result = n.sym.ast
 
 proc getName(n: PNode): string =
-  doAssert n.kind in {nkIdent, nkSym, nkStrLit, nkProcDef, nkFuncDef}, "Unsupported kind " & $n.kind
+  doAssert n.kind in {nkIdent, nkSym, nkStrLit, nkProcDef, nkFuncDef, nkPostfix}, "Unsupported kind " & $n.kind & " of node: " & $n.renderTree
   case n.kind
   of nkIdent:
     result = n.ident.s
@@ -284,6 +284,9 @@ proc getName(n: PNode): string =
     result = n.strVal
   of nkProcDef, nkFuncDef:
     result = n[0].getName()
+  of nkPostfix:
+    doAssert n[0].getName() == "*", "Postfix was not an exported field: " & $n.renderTree
+    result = n[1].getName()
   else:
     doAssert false, "Not supported"
 
