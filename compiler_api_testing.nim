@@ -2048,7 +2048,8 @@ proc evalString(code1, code2: string) =
   #intr.jitAst(barT.ast, "bar")
   shutdownInterpreter(intr)
 
-let string2 = """
+proc nonRepl =
+  let string2 = """
 import system/ansi_c
 proc testMathImpl(x, y: float): float =
   let z = x * y
@@ -2056,32 +2057,32 @@ proc testMathImpl(x, y: float): float =
 
 proc testMath*() =
   c_printf("%f\n", testMathImpl(1.34, 532.112))
-"""
+  """
 
-## XXX: currently broken due to `nkHiddenAddr`, but *ALSO* results in a libgccjit error
-# libgccjit.so: error: gcc_jit_context_new_call: mismatching types for argument 1 of function "addInt": assignment to param result (type: struct NimStringV2 * * *) from &result (type: struct NimStringV2 * * *)
-# libgccjit.so: error: gcc_jit_block_add_eval: NULL rvalue
-let strRepr = """
+  ## XXX: currently broken due to `nkHiddenAddr`, but *ALSO* results in a libgccjit error
+  # libgccjit.so: error: gcc_jit_context_new_call: mismatching types for argument 1 of function "addInt": assignment to param result (type: struct NimStringV2 * * *) from &result (type: struct NimStringV2 * * *)
+  # libgccjit.so: error: gcc_jit_block_add_eval: NULL rvalue
+  let strRepr = """
 import system/ansi_c
 proc test*() =
   let x = 1
   c_printf("%s \n", $x)
-"""
+  """
 
 
-## This leads to an effective generic, due to `$` for `float` also being `$` for `float32`
-## via a `float | float32` resulting in a `tyOr`. We need to use the arguments type to
-## deduce the correct type!
-let strReprGeneric = """
+  ## This leads to an effective generic, due to `$` for `float` also being `$` for `float32`
+  ## via a `float | float32` resulting in a `tyOr`. We need to use the arguments type to
+  ## deduce the correct type!
+  let strReprGeneric = """
 import system/ansi_c
 proc test*() =
   let x = 1.2343
   c_printf("%s \n", $x)
-"""
+  """
 
 
-# Test 1 tests whether general unchained logic works
-let unchTest = """
+  # Test 1 tests whether general unchained logic works
+  let unchTest = """
 import unchained
 import system/ansi_c
 proc test*() =
@@ -2089,9 +2090,9 @@ proc test*() =
   let z = x.toDef(g•cm•s⁻²)
   c_printf("%f \n", z)
   #c_printf("%s \n", $z)
-"""
-# Test 2 checks if string conversion works
-let unch2Test = """
+  """
+  # Test 2 checks if string conversion works
+  let unch2Test = """
 import unchained
 import system/ansi_c
 proc test2*() =
@@ -2099,10 +2100,10 @@ proc test2*() =
   let z = x.toDef(g•cm•s⁻²)
   #c_printf("%f \n", z)
   c_printf("%s \n", $z)
-"""
+  """
 
 
-let runtimeString = """
+  let runtimeString = """
 import system/ansi_c
 proc foo*(x, y: int) =
   let z = x + y
@@ -2150,11 +2151,11 @@ proc testNestedBlocks*(x, y: int): int =
 
 let x* = @[1, 2, 3]
 echo "Hello World"
-"""
+  """
 
-#evalString(unchTest, unch2Test)
-evalString(strRepr, unch2Test)
-let miniBench = """
+  #evalString(unchTest, unch2Test)
+  evalString(strRepr, unch2Test)
+  let miniBench = """
 import system/ansi_c
 proc foo*() =
   var x = 0.0
@@ -2162,6 +2163,226 @@ proc foo*() =
     x = x * 1.0000000001123 + 0.1
     #x = x + 1 # fix `inc x`
   c_printf("%f \n", x)
-"""
+  """
 
-#evalString(miniBench, runtimeString)
+  #evalString(miniBench, runtimeString)
+
+import std / [strutils, strformat]
+import noise
+
+type
+  Repl = object
+    intr: Interpreter
+    ctx: JitContext
+    # Table of all precompiled functions
+    # Maps function name to the compiled result ptr
+    fnTab: Table[string, ptr gcc_jit_result]
+    imports: string
+    stream: PLLStream
+    streamOpened = false
+    buffer: string
+
+  InputKind = enum
+    ikProcDef, ikStatement, ikImport, ikExpression
+
+proc inputKind(line: string): InputKind =
+  ## XXX: this will be improved obv
+  if line.strip.startsWith("proc"): result = ikProcDef
+  # we need to ask the nim compiler what the resulting type is!
+  # Question: how do we deal with the *nim compiler* knowing the state? I.e. referencing a variable
+  # `foo` 10 REPL statements after? Does that happen "automatically"?
+  #elif
+  elif line.strip.startsWith("import"): result = ikImport
+  else: result = ikStatement
+
+proc jitOnly(repl: var Repl, p: PNode, name: string) =
+  ## Perform JIT compilation of the given Nim AST at runtime by mapping the
+  ## nodes to `libgccjit` calls.
+  echo "Jit fn"
+  let t0 = epochTime()
+  let jitted = jitFn(repl.ctx, p)
+  let t1 = epochTime()
+  repl.fnTab[name] = gcc_jit_context_compile(repl.ctx.ctx)
+  echo "Compiling ", name, " took: ", epochTime() - t0, " s and only compile: ", epochTime() - t1, " s"
+
+proc callFn(repl: Repl, name: string): string =
+  ## This calls functions that we *wrapped ourselves* in the REPL, i.e.
+  ## `proc(): void` functions which will print the statement written by the user.
+  var res = repl.fnTab[name]
+  if res.isNil:
+    echo "nil result"
+  # Extract the generated code from "result".
+  type
+    fnTypeVoid = proc() {.nimcall.}
+  when true:
+    var fn = cast[fnTypeVoid](gcc_jit_result_get_code(res, name))
+    if fn.isNil:
+      echo "nil fn"
+    # Now call the generated function: */
+    let t0 = epochTime()
+    fn()
+  stdout.write("\n")
+  echo "Took ", epochTime() - t0, "s"
+  stdout.flushFile()
+
+proc getFnName(line: string): string =
+  result = line.strip()
+  result.removePrefix("proc")
+  let idx = result.find("(")
+  result.delete(idx, result.len)
+  result = result.strip()
+  echo "FN NAME: ", result, " from ", line
+
+template withReplStream(code: untyped): untyped =
+  let t0 = epochTime()
+  #if not repl.streamOpened:
+  #  repl.stream = llStreamOpen(code)
+  #  repl.streamOpened = true
+  repl.stream = llStreamOpen(code)
+  repl.intr.evalScript(repl.stream)
+  llStreamClose(repl.stream)
+  echo "Nim compiling took: ", epochTime() - t0, " s"
+
+proc handleProcDef(repl: var Repl, line: string) =
+  ## MORE STUFF
+  let fnName = getFnName(line)
+  # make sure `fn` exported
+  var line = line
+  if "*" notin line:
+    line = line.replace(fnName, fnName & "*")
+  repl.buffer.add line & "\n"
+  withReplStream(repl.buffer)
+  let t = repl.intr.selectRoutine(fnName)
+  echo "Jit it"
+  repl.jitOnly(t.ast, fnName)
+
+var counter = 0
+proc handleStatement(repl: var Repl, line: string) =
+  ## Statement: place in temporary proc and jit & run
+  var gn = "wrapper_fn_" & $counter
+  inc counter
+  var body = &"{repl.imports}\nproc {gn}*() =\n  {line}"
+  echo "Body: ", body
+  repl.buffer.add body & "\n"
+  withReplStream(repl.buffer)
+
+  echo "Select: ", gn
+  let t = repl.intr.selectRoutine(gn)
+  echo "Is nil? ", t.isNil
+  echo "Jit it ", t.ast.renderTree
+  repl.jitOnly(t.ast, gn)
+  echo "Done jitting, call"
+  # now call wrapper
+  discard repl.callFn(gn)
+
+proc handleImport(repl: var Repl, line: string) =
+  ## Imports for now are just appended to the import header, which is prefixed
+  ## globally to an a statement
+  repl.imports.add line & "\n"
+
+proc handleUserInput(repl: var Repl, line: string) =
+  # pass code through nim compiler
+  case line.inputKind
+  of ikProcDef:
+    # just JIT compile the proc!
+    repl.handleProcDef(line)
+  of ikStatement:
+    # JIT compile the body and run
+    repl.handleStatement(line)
+  of ikImport:
+    # handle imports
+    repl.handleImport(line)
+  of ikExpression: doAssert false
+
+proc printHelp() = discard
+
+proc repl(repl: var Repl) =
+  var noise = Noise.init()
+
+  let prompt = Styler.init(fgRed, "Red ", fgGreen, "nim> ")
+  noise.setPrompt(prompt)
+
+  when promptPreloadBuffer:
+    noise.preloadBuffer("")
+
+  when promptHistory:
+    var file = "history"
+    discard noise.historyLoad(file)
+
+  when promptCompletion:
+    proc completionHook(noise: var Noise, text: string): int =
+      const words = ["apple", "diamond", "diadem", "diablo", "horse", "home", "quartz", "quit"]
+      for w in words:
+        if w.find(text) != -1:
+          noise.addCompletion w
+
+    noise.setCompletionHook(completionHook)
+
+  while true:
+    let ok = noise.readLine()
+    if not ok: break
+
+    ## XXX: figure out how to input multiple lines
+    let line = noise.getLine
+    case line
+    of ".help": printHelp()
+    of ".quit": break
+    else:
+      if line.len > 0:
+        repl.handleUserInput(line.strip)
+
+    when promptHistory:
+      if line.len > 0:
+        noise.historyAdd(line)
+        discard noise.historySave(file)
+
+  when promptHistory:
+    discard noise.historySave(file)
+
+
+proc setupRepl =
+  echo "setting up interpreter"
+  var intr = setupInterpreter()
+  # add Unchained
+  # [X] Adding at runtime works just fine after the interpreter is constructed!
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/CastData/ExternCode/units/src")
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/CastData/ExternCode/sortedSeq/")
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/src/nim/arraymancer/src")
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/.nimble/pkgs2/nimblas-0.2.2-bf7a368e3801dff08d1d71292c32db904a4c639b")
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/.nimble/pkgs2/nimlapack-0.2.2-eeb3e532dee64b71a1904f4a42b657fffeed1fef")
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/.nimble/pkgs2/zip-0.3.1-747aab3c43ecb7b50671cdd0ec3b2edc2c83494c")
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/.nimble/pkgs2/untar-0.1.0-ceb12634783156ddd511410242dc7855ae2f4a14")
+  intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/.nimble/pkgs2/stb_image-2.5-abf5fd03e72ee4c316c50a0538b973e355dcb175")
+  # ^--- this way we can add more paths when user imports libraries!
+  ## XXX: add `extract import from user input` and then add those imports like this
+  # set up gcc jit context
+  let jitCtx = initJitContext(intr, true)
+  var repl = Repl(intr: intr, ctx: jitCtx)
+  repl(repl)
+
+proc main(repl = false) =
+  if repl:
+    setupRepl()
+  else:
+    nonRepl()
+when isMainModule:
+  import cligen
+  dispatch main
+
+#[
+These are broken:
+
+- type Ar = array[8, float]; var a: Ar; a[4] = 1.1123; c_printf("%f", a[4])
+- type Ar = array[8, float]; var a: Ar; a[3] = 1.1123; c_printf("%f", a[4])
+-> Bus error
+- type Ar = array[8, float]; var a: Ar; a[3] = 1.1123; c_printf("%f", a[3])
+-> *** stack smashing detected ***: terminated
+-> SIGABRT
+
+But either of these work:
+
+- type Ar = array[8, float]; var a: Ar; a[0] = 1.1123; c_printf("%f", a[0])
+- type Ar = array[8, float]; var a: Ar; a[1] = 1.1123; c_printf("%f", a[1])
+- type Ar = array[8, float]; var a: Ar; a[2] = 1.1123; c_printf("%f", a[2])
+
+]#
