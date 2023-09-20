@@ -1866,8 +1866,9 @@ proc jitAst(intr: Interpreter, p: PNode, name: string) =
 
     let t0 = epochTime()
     fn()
-    echo "Took ", epochTime() - t0, "s"
+  stdout.write("\n")
   stdout.flushFile()
+  echo "Took ", epochTime() - t0, "s"
 
   gcc_jit_context_release(jitCtx.ctx)
   gcc_jit_result_release(res)
