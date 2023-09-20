@@ -1978,6 +1978,7 @@ proc setupInterpreter(moduleName = "/t/script.nim"): Interpreter =
   paths.add std & "/pure"
   paths.add std & "/core"
   paths.add std & "/pure/collections"
+  paths.add std & "/posix"
   paths.add "/home/basti/.nimble/pkgs"
   #paths.add "/home/basti/CastData/ExternCode/units/src"
   result = createInterpreter(moduleName, paths, defines = @[])
@@ -1997,6 +1998,8 @@ proc evalString(code1, code2: string) =
   # add Unchained
   # [X] Adding at runtime works just fine after the interpreter is constructed!
   intr.graph.config.searchPaths.add(AbsoluteDir "/home/basti/CastData/ExternCode/units/src")
+
+  echo "Code 1 : ", code1
   withStream(code1)
 
   ## XXX: have to apply the transformations when calling `jitFn` internally!
@@ -2013,12 +2016,17 @@ proc evalString(code1, code2: string) =
   #let t = intr.selectRoutine("foo")
   #intr.jitAst(t.ast, "foo")
 
+  echo "Select test"
   let t = intr.selectRoutine("test")
+  echo "Jit it"
   intr.jitAst(t.ast, "test")
   #
-  withStream(code2)
-  let t2 = intr.selectRoutine("test2")
-  intr.jitAst(t2.ast, "test2")
+  #echo "Code 2 : ", code2
+  #withStream(code2)
+  #echo "test2"
+  #let t2 = intr.selectRoutine("test2")
+  #echo "jit 2"
+  #intr.jitAst(t2.ast, "test2")
 
 
   #let fn = intr.selectRoutine("foo")
