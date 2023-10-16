@@ -767,8 +767,9 @@ proc toJitType(n: JitNode): ptr gcc_jit_type =
 proc toJitType[T](jitCtx: JitContext, typ: typedesc[T]): ptr gcc_jit_type =
   jitCtx.ctx.gcc_jit_context_get_type(toJitType($T))
 
-proc toRValue(jitCtx: JitContext, val: string{lit}): ptr gcc_jit_rvalue =
-  jitCtx.ctx.gcc_jit_context_new_string_literal(val)
+#proc toRValue(jitCtx: JitContext, val: string{lit}): ptr gcc_jit_rvalue =
+#  # construct a NimStringV2
+#  #jitCtx.ctx.gcc_jit_context_new_string_literal(val)
 
 proc toRValue(jitCtx: JitContext, val: cstring): ptr gcc_jit_rvalue =
   jitCtx.ctx.gcc_jit_context_new_string_literal(val)
@@ -810,9 +811,44 @@ proc toRValue[T: not openArray](jitCtx: JitContext, val: T): ptr gcc_jit_rvalue 
   else:
     doAssert false, "Type " & $T & " is not supported yet."
 
+
+proc assign(ctx: JitContext, lvalue, rvalue: JitNode)
+proc address(n: JitNode): JitNode
+proc toRValue[T: object | string](jitCtx: JitContext, val: T): ptr gcc_jit_rvalue =
+  ## Use `gcc_jit_context_new_struct_constructor` to construct the value directly
+  when T is string:
+    ## Construct NimStringV2 from runtime value (e.g. for a `nkStrLit` after constructing a Nim string
+    ## from that)
+    let numValues = 2.csize_t ## len + payload and cap + data
+    let strLen = val.len
+
+    echo "STRING:::::::: ", val
+    let payloadType = jitCtx.types["NimStrPayload"]
+    let f = payloadType.`fields`
+    let fieldsPayload = [toPtrField f["cap"], toPtrField f["data"]] # [toPtrField jitCtx.newField(toJitNode jitCtx.toJitType(int), "cap"),
+                         # toPtrField jitCtx.newField(toJitNode jitCtx.toJitType(ptr char), "data")]
+    let valuesPayload = [jitCtx.toRValue(strLen), jitCtx.toRValue(cast[ptr char](val[0].addr))]
+    let payload = jitCtx.ctx.gcc_jit_context_new_struct_constructor(nil, payloadType.typ, numValues, fieldsPayload[0].addr, valuesPayload[0].addr)
+
+    let typ = jitCtx.types["NimStringV2"]
+    let ff = typ.`fields`
+    let fields = [toPtrField ff["len"], toPtrField ff["p"]]
+    let values = [jitCtx.toRValue(strLen), payload]
+    let nimStrV2 = jitCtx.ctx.gcc_jit_context_new_struct_constructor(nil, typ.typ, numValues, fields[0].addr, values[0].addr)
+
+    ## XXX: Not sure how we construct this! The new_struct_constructor allows us to construct a struct, but not a pointer, right?
+    ## Do we need to first construct a local lvalue? I'm confused.
+    ## -> This seems to work, temp local variable
+    ## Now we need the inverse, string -> cstring
+    let localStrV2 = jitCtx.newLocal(toJitNode typ.typ, "tmp_struct_strv2")
+    jitCtx.assign(localStrV2, toJitNode nimStrV2)
+    result = toPtrRValue address(localStrV2)
+  else:
+    doAssert false
+
 proc toRValue[T](jitCtx: JitContext, val: typedesc[T]): ptr gcc_jit_rvalue =
   var tmp = default(T)
-  result = jitCtx.toRValueu(tmp)
+  result = jitCtx.toRValue(tmp)
 
 proc toRValue(jitCtx: JitContext, val: PNode): ptr gcc_jit_rvalue =
   doAssert val.kind in nkLiterals
@@ -1237,7 +1273,7 @@ proc address(n: JitNode): JitNode =
     "ptr " & n.name
   )
 
-
+from std/strutils import startsWith
 proc buildArgs(ctx: JitContext, fnName: string, n: PNode): JitNode =
   result = initJitNode(jtSeq)
   ## XXX: use the information we have about the function we call and what types
@@ -1293,6 +1329,16 @@ proc genAddr(ctx: JitContext, n: PNode): JitNode =
     n.renderTree()
   )
 
+proc genAddr(ctx: JitContext, n: JitNode): JitNode =
+  result = toJitNode(
+    gcc_jit_lvalue_get_address(
+      toLValue(n),
+      nil
+    ),
+    "Addr: " & n.name
+  )
+
+
 #proc gcc_jit_context_new_cast*(ctxt: ptr gcc_jit_context; loc: ptr gcc_jit_location;
 #                              rvalue: ptr gcc_jit_rvalue; `type`: ptr gcc_jit_type): ptr gcc_jit_rvalue {.
 #    cdecl, importc: "gcc_jit_context_new_cast", dynlib: libgccjit.}
@@ -1321,7 +1367,10 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
     ## correct one?
     result = ctx.getVariable(body)
   of nkLiterals:
-    result = toJitNode(ctx.toRValue(body)) # `literals` will be wrapped by `toRValue`, which makes it safe
+    if body.kind == nkStrLit:
+      result = toJitNode(ctx.toRValue(body.strVal))
+    else:
+      result = toJitNode(ctx.toRValue(body)) # `literals` will be wrapped by `toRValue`, which makes it safe
   #of nkConv:
   #  result = body
   of nkHiddenStdConv:
@@ -1345,9 +1394,9 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
     # Note: this implies it is of `void` return type, otherwise we
     # would have seen let / var / asgn
     # 1. first a new block
-    let fnName = body[0].getName()
+    let fnName = body[0].getName(body)
     echo "CALL FN ", fnName, " with rvalue? ", ctx.nextCallRValue
-    let fnCall = ctx.getFunction(body[0])
+    let fnCall = ctx.getFunction(body[0], body)
     let args = ctx.buildArgs(fnName, body)
     ## XXX: thanks to discardable we can't use `geType` to determine if we need `add_eval`
     ## - check for `sfDiscardable` somewhere? Not useful here though
@@ -1554,6 +1603,10 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
       result = ctx.deref(body[0])
   of nkAddr:
     result = ctx.genAddr(body)
+  of nkHiddenAddr:
+    ## XXX: THis is also wrong!
+    ## Test with: `let x = 5; let z = $x`
+    result = ctx.genAddr(ctx.genNode(body[0]))
   #of nkForStmt:
   #  echo body.treerepr
   #
