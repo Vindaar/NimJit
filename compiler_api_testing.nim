@@ -1,7 +1,9 @@
 import compiler/[nimeval, llstream, renderer, types, magicsys, ast,
                  transf, # for code transformation (for -> while etc)
                  injectdestructors, # destructor injection
-                 pathutils] # AbsoluteDir
+                 pathutils, # AbsoluteDir
+                 modulegraphs] # getBody
+
 
 # probably need to import `pragmas` and `wordrecg` to get
 # `hasPragma` working
@@ -803,6 +805,10 @@ proc toRValue[T: not openArray](jitCtx: JitContext, val: T): ptr gcc_jit_rvalue 
     jitCtx.ctx.gcc_jit_context_new_rvalue_from_int(jitCtx.toJitType(typeof(val)), if val: 1.cint else: 0.cint)
   elif T is ptr gcc_jit_rvalue:
     val # no-op
+  elif T is ptr char:
+    jitCtx.toRValue(cast[cstring](val))
+  elif T is pointer:
+    jitCtx.ctx.gcc_jit_context_new_rvalue_from_ptr(jitCtx.toJitType(pointer), val)
   #elif T is string:
   #  ctx.
   #elif T is openArray:
@@ -867,6 +873,7 @@ proc toRValue(jitCtx: JitContext, val: PNode): ptr gcc_jit_rvalue =
   of nkStrLit..nkTripleStrLit:
     ## XXX: is it sensible to check here for `true` and `false`? What happens if input
     ## is a string of that value?
+    ## -> Should check for type of node!
     if val.getName() == "true":
       doAssert val.typ.kind == tyBool, "Handle string!"
       result = jitCtx.ctx.gcc_jit_context_new_rvalue_from_int(
@@ -1157,7 +1164,6 @@ proc newLocalAsgn(ctx: JitContext, ident: PNode): JitNode =
     withRValue(ctx):
       let rval = ctx.genNode(ident[2])
     # now assign rval to lval
-    echo "RVAL: ", rval
     ctx.assign(result, rval)
   # else this was a `var` section *without* an initialization
 
@@ -2297,7 +2303,9 @@ proc callFn(repl: Repl, name: string): string =
   ## `proc(): void` functions which will print the statement written by the user.
   var res = repl.fnTab[name]
   if res.isNil:
-    echo "nil result"
+    echo "nil result for fn: ", name
+  else:
+    echo "not nil ! ", name
   # Extract the generated code from "result".
   type
     fnTypeVoid = proc() {.nimcall.}
@@ -2305,6 +2313,8 @@ proc callFn(repl: Repl, name: string): string =
     var fn = cast[fnTypeVoid](gcc_jit_result_get_code(res, name))
     if fn.isNil:
       echo "nil fn"
+    else:
+      echo "not nil!"
     # Now call the generated function: */
     let t0 = epochTime()
     fn()
@@ -2358,7 +2368,7 @@ proc handleStatement(repl: var Repl, line: string) =
   echo "Is nil? ", t.isNil
   echo "Jit it ", t.ast.renderTree
   repl.jitOnly(t.ast, gn)
-  echo "Done jitting, call"
+  echo "Done jitting, call ", gn
   # now call wrapper
   discard repl.callFn(gn)
 
