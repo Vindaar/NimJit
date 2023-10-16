@@ -2482,4 +2482,10 @@ But either of these work:
 - type Ar = array[8, float]; var a: Ar; a[1] = 1.1123; c_printf("%f", a[1])
 - type Ar = array[8, float]; var a: Ar; a[2] = 1.1123; c_printf("%f", a[2])
 
+
+Also:
+`string` is currently broken!!
+- `let x = "hello"`
+fails because it doesn't do the conversion of `const char *` to `struct NimStringV2 *`!
+
 ]#
