@@ -273,7 +273,7 @@ proc getTypeImpl(n: PNode): PNode =
 proc getImpl(n: PNode): PNode =
   result = n.sym.ast
 
-proc getName(n: PNode): string =
+proc getName(n: PNode, theNode: PNode = nil): string =
   doAssert n.kind in {nkIdent, nkSym, nkStrLit, nkProcDef, nkFuncDef, nkPostfix}, "Unsupported kind " & $n.kind & " of node: " & $n.renderTree
   case n.kind
   of nkIdent:
@@ -289,6 +289,12 @@ proc getName(n: PNode): string =
     result = n[1].getName()
   else:
     doAssert false, "Not supported"
+  if result == "$":
+    result = "DOLLAR"
+  elif result == "=destroy":
+    doAssert theNode != nil, "Need the node for the type!"
+    let t = theNode[1].typ.skipTypes(abstractVar)
+    result = "destroy" & typeToString(t)
 
 proc hasPragmaImpl(pragmas: PNode, pragma: string): bool =
   doAssert pragmas.kind in {nkEmpty, nkPragma}, "Got " & $pragmas.kind
@@ -1162,16 +1168,17 @@ proc getVariable(ctx: JitContext, n: PNode): JitNode =
 
 #proc jitFn(jitCtx: JitContext, fn: PNode, functionKind: gcc_jit_function_kind): JitNode
 proc jitFn(jitCtx: JitContext, fn: PNode): JitNode
-proc lookupMagic(ctx: JitContext, fn: PNode): JitNode
+proc lookupMagic(ctx: JitContext, fn: PNode, theNode: PNode = nil): JitNode
 
 
-proc getFunction(ctx: JitContext, n: PNode): JitNode =
+proc getFunction(ctx: JitContext, n: PNode, theNode: PNode): JitNode =
   doAssert n.kind in {nkIdent, nkSym}
   #doAssert n.getName() in ctx.fnTab, "Function " & $n.getName() & " not jit'd yet."
   if n.kind == nkSym and n.sym.magic != mNone:
     echo "fonud a magic??"
-    result = ctx.lookupMagic(n)        # if we have no failed
-    result = ctx.fnTab[n.getName()].fn # safe to get the magic
+    ## XXX: ALSO hand arguments to deduce type for destructor / lookup the body?
+    result = ctx.lookupMagic(n, theNode)        # if we have no failed
+    result = ctx.fnTab[n.getName(theNode)].fn # safe to get the magic
   elif n.getName() in ctx.fnTab:
     echo "found a regular proc???"
     result = ctx.fnTab[n.getName()].fn
@@ -1889,6 +1896,32 @@ proc inc*(x: var int, y = 1) =
   let fnAst = ctx.getAst(magicBody, "inc")
   result = ctx.jitFn(fnAst)
 
+from std / strutils import `%`
+proc lookupDestroy(ctx: JitContext, fn: PNode, theNode: PNode): JitNode =
+  if theNode != nil:
+    let t = theNode[1].typ.skipTypes(abstractVar)
+    echo t.kind
+    let op = getAttachedOp(ctx.intr.graph, t, attachedDestructor)
+    if op != nil:
+      let b = getBody(ctx.intr.graph, op)
+      echo b.treerepr
+    const magicBody = """
+#import system/ansi_c
+proc $#*(x: var $#) =
+  #c_printf("Leaking memory\n")
+  discard
+"""
+    let tStr = t.typeToString()
+    let name = "destroy" & $tStr
+    let mBody = magicBody % [name, tStr]
+    echo mBody
+    let fnAst = ctx.getAst(mBody, name)
+    result = ctx.jitFn(fnAst)
+
+#  ## XXX: we need to handle the destructors properly! Faking it is not going to work very well.
+#  ## We could construct a `destroyFoo` for every `Foo` type we encounter. This would mean
+#  ## in `getName` we would need to construct the `destroyFoo` name as well!
+
 proc lookupStrLength(ctx: JitContext, fn: PNode): JitNode =
   const magicBody = """
 type
@@ -1939,9 +1972,9 @@ proc lookupCompilerProc(ctx: JitContext, sym: PSym, name: string): JitNode =
   #if true: quit()
   result = ctx.jitFn(trnsf)
 
-proc lookupMagic(ctx: JitContext, fn: PNode): JitNode =
+proc lookupMagic(ctx: JitContext, fn: PNode, theNode: PNode = nil): JitNode =
   ## Returns a JIT compiled version of the given magic function
-  let fnName = fn.getName()
+  #let fnName = fn.getName()
   var fnSym: PSym
   if fn.kind == nkCall:
     fnSym = fn[0].sym
@@ -1957,6 +1990,7 @@ proc lookupMagic(ctx: JitContext, fn: PNode): JitNode =
   of mEcho: result = ctx.lookupCompilerProc(fnSym, "echoBinSafe")
   of mLengthStr: result = ctx.lookupStrLength(fn) #ctx.lookupLength(fnSym, "len")
   of mLengthOpenArray: result = ctx.lookupLengthOpenArray(fn) #ctx.lookupLength(fnSym, "len")
+  of mDestroy: result = ctx.lookupDestroy(fn, theNode)
   of mNewString:
     echo fn.treerepr
     var opr = fnSym
