@@ -250,19 +250,21 @@ proc getTypeKind(n: PNode): TTypeKind =
   result = if n.kind == nkEmpty: tyEmpty
            else: n.typ.kind
 
-proc newPType(typ: TTypeKind): PType =
+proc newPType(jitCtx: JitContext, typ: TTypeKind): PType =
   ## Creates a new dummy `PType` of the given typ
-  result = newType(typ, ItemID(module: -1, item: -1), newNode(nkSym).sym)
+  let idGen = jitCtx.intr.idgen
+  result = newType(typ, idGen, newNode(nkSym).sym)
 
-proc newPType(typ: TTypeKind, son: TTYpeKind): PType =
+proc newPType(jitCtx: JitContext, typ: TTypeKind, son: TTYpeKind): PType =
   ## Creates a new dummy `PType` of the given types
-  result = newType(typ, ItemID(module: -1, item: -1), newNode(nkSym).sym)
-  let son = newType(son, ItemID(module: -1, item: -1), newNode(nkSym).sym)
+  let idGen = jitCtx.intr.idgen
+  result = newType(typ, idGen, newNode(nkSym).sym)
+  let son = newType(son, idGen, newNode(nkSym).sym)
   result.rawAddSon(son)
 
-proc getTypeNode(n: PNode): PType =
+proc getTypeNode(jitCtx: JitContext, n: PNode): PType =
   # if the given node is empty, generate a dummy `PType`
-  result = if n.kind == nkEmpty: newPType(tyEmpty)
+  result = if n.kind == nkEmpty: jitCtx.newPType(tyEmpty)
            else: n.typ
 
 proc getTypeImpl(n: PNode): PNode =
@@ -578,12 +580,12 @@ proc newStringType(jitCtx: JitContext): JitNode = #, typ: PType)
   else:
     block NimStrPayload:
       let names = @["cap", "data"]
-      let types = @[jitCtx.toJitType(newPType(tyInt)), jitCtx.toJitType(newPType(tyPtr, tyChar))]
+      let types = @[jitCtx.toJitType(jitCtx.newPType(tyInt)), jitCtx.toJitType(jitCtx.newPType(tyPtr, tyChar))]
       let strPayload = jitCtx.newStruct("NimStrPayload", names, types)
     block NimStringV2:
       doAssert "NimStrPayload" in jitCtx.types
       let names = @["len", "p"]
-      let types = @[jitCtx.toJitType(newPType(tyInt)), toJitNode(jitCtx.types["NimStrPayload"].typ,
+      let types = @[jitCtx.toJitType(jitCtx.newPType(tyInt)), toJitNode(jitCtx.types["NimStrPayload"].typ,
                                                                  "NimStrPayload")]
       let strBase = jitCtx.newStruct("NimStringV2", names, types)
     block stringType:
@@ -602,10 +604,10 @@ proc newOpenArrayType(jitCtx: JitContext, typ: PType): JitNode =
     result = toJitNode(jitCtx.types[typName].typ, typName)
   else:
     # construct new type for this inner
-    let inner = typ.lastSon()
+    let inner = typ.last()
     let names = @["data", "len"]
     let types = @[jitCtx.newPointer(jitCtx.toJitType(inner)),
-                  jitCtx.toJitType(newPType(tyInt))]
+                  jitCtx.toJitType(jitCtx.newPType(tyInt))]
     result = jitCtx.newStruct(typName, names, types)
 
 proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
@@ -700,34 +702,34 @@ proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
     ## construct a fixed size array
     ## XXX: for now use element 0 for the type, but maybe we can get i
     ## from the bracket itself?
-    let typNode = jitCtx.toJitType(typ.lastSon()) #jitCtx.toJitType(typ)
+    let typNode = jitCtx.toJitType(typ.last()) #jitCtx.toJitType(typ)
     let name = typ.typeToString()
-    result = jitCtx.newArrayType(typNode, name, typ.numSons)
+    result = jitCtx.newArrayType(typNode, name, typ.kidsLen)
   of tyVar, tyRef, tyPtr:
     ## type is pointer to n[0]
     #echo typ.sym.ast.treerepr
-    result = jitCtx.newPointer(typ.lastSon())
+    result = jitCtx.newPointer(typ.last())
   of tyOpenArray:
     ## effectively `ptr T`, `len` pair, no?
     result = jitCtx.newOpenArrayType(typ)
   of tyLent:
     ## XXX: hack
-    result = jitCtx.toJitType(typ.lastSon())
+    result = jitCtx.toJitType(typ.last())
   of tyTypedesc:
-    result = jitCtx.toJitType(typ.lastSon())
+    result = jitCtx.toJitType(typ.last())
   of tyGenericInst:
     ## XXX: use something similar to `nlvm` of having types we don't care about
     ## "irrelevant for backend" and consider using `skipTypes`
     #echo typ.skipTypes({tyGenericInst, tyObject}).kind
-    result = jitCtx.toJitType(typ.lastSon())
+    result = jitCtx.toJitType(typ.last())
   of tyAlias, tyDistinct:
-    result = jitCtx.toJitType(typ.lastSon())
+    result = jitCtx.toJitType(typ.last())
   of tyEnum:
     ## XXX: hack!!!
     result = jitCtx.newType(tyInt)
   of tyRange:
     ## XXX: HACK!!!
-    result = jitCtx.toJitType(typ.lastSon())
+    result = jitCtx.toJitType(typ.last())
   of tyGenericParam:
     ## XXX: we have the problem that for an `openArray[string]` the type of `ptr string`
     ## the `string` field is only an `ident string` of type `tyGenericParam` (this call)
@@ -738,7 +740,7 @@ proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
     echo typ.typeInst.isNil
     echo typ.sym.kind, " ", typ.sym.ast.treerepr
     #echo typ.lastSon
-    result = jitCtx.toJitType(typ.lastSon())
+    result = jitCtx.toJitType(typ.last())
     #echo "--------------------------------"
     #echo typ.kind
     #for s in typ.sons:
@@ -758,7 +760,7 @@ proc toJitType(jitCtx: JitContext, typ: PType): JitNode = # ptr gcc_jit_type =
 
 proc toJitType(jitCtx: JitContext, n: PNode): JitNode =
   echo "WHAT ", n.treerepr
-  result = jitCtx.toJitType(n.getTypeNode())
+  result = jitCtx.toJitType(jitCtx.getTypeNode(n))
 
 proc toJitType(n: JitNode): ptr gcc_jit_type =
   case n.kind
@@ -1066,7 +1068,7 @@ proc toImpl(fn: PNode): PNode =
 
 proc toSeparateOpenArray(jitCtx: JitContext, typ: PType): JitNode =
   result = initJitNode(jtSeq)
-  result.add jitCtx.newPointer(typ.lastSon())
+  result.add jitCtx.newPointer(typ.last())
   result.add jitCtx.newType(tyInt)
 
 proc genParam(jitCtx: JitContext, fn: string, n: PNode, typ: PNode): JitNode =
@@ -1767,7 +1769,7 @@ proc jitFn(jitCtx: JitContext, fn: PNode): JitNode =
   result = initJitNode(jtSeq)
   ## init the `JitContext` object, potentially initiating the full `libgccjit` context
   # get the return type
-  let retParam = params[0].getTypeNode()
+  let retParam = jitCtx.getTypeNode(params[0])
   # construct new function
   let fnName = fn.getFunctionName()
   let fnSymbolName = fn.name.getName()
@@ -1887,7 +1889,7 @@ proc performTransformation(intr: Interpreter, p: PSym): PSym =
   ## etc.
   ##
   ## After transformation it further injects destructors.
-  var trnsf = intr.graph.transformBody(intr.idgen, p, dontUseCache)
+  var trnsf = intr.graph.transformBody(intr.idgen, p, {})
   #echo trnsf.treerepr
   trnsf = injectDestructorCalls(intr.graph, intr.idgen, p, trnsf)
   #echo "incl destructors: ", trnsf.treerepr
