@@ -1897,9 +1897,18 @@ proc performTransformation(intr: Interpreter, p: PSym): PSym =
   ## etc.
   ##
   ## After transformation it further injects destructors.
-  var trnsf = intr.graph.transformBody(intr.idgen, p, {})
-  #echo trnsf.treerepr
-  trnsf = injectDestructorCalls(intr.graph, intr.idgen, p, trnsf)
+  echo p.name.repr
+  echo p.kind
+  var trnsf: PNode
+  if prc.kind in routineKinds:
+    trnsf = intr.graph.transformBody(intr.idgen, p, {})
+    #echo trnsf.treerepr
+    trnsf = injectDestructorCalls(intr.graph, intr.idgen, p, trnsf)
+  else:
+    ## XXXXXXXXXXXXX: The idea here was to transform e.g. a type definition so that
+    ## `when` branches are evaluated based on current `defines`. But that idea isn't
+    ## going to work I think.
+    trnsf = intr.graph.transformStmt(intr.idgen,
   #echo "incl destructors: ", trnsf.treerepr
   #echo trnsf.renderTree()
   #echo p.ast.treerepr
