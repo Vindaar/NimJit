@@ -1668,6 +1668,14 @@ proc genNode(ctx: JitContext, body: PNode): JitNode =
           val
         )
     result = toJitNode(ctx.toRValue(loc), varName)
+  of nkWhenStmt:
+    if body[0].kind == nkElifBranch and body[0][0].kind == nkIdent and
+       body[0][0].getName() == "nimvm": # just evaluate other branch
+      result = ctx.genNode(body[1][0]) # body of `Else` branch
+    else:
+      echo body.treerepr
+      echo body.renderTree()
+      doAssert false, "Unsupported when branch: " & $body.kind
   else:
     echo body.treerepr
     echo body.renderTree()
